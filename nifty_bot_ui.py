@@ -171,20 +171,34 @@ def force_numeric_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
     """
-    Fetch 1-minute candles for ONLY the given day (no fallback).
+    Fetch candles for a given day.
+    - If day == today (IST): use intraday endpoint (live running candles)
+    - Else: use historical day endpoint
     """
-    d = date_str(day)
     encoded = quote(instrument_key, safe="")
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded}/{INTERVAL}/{d}/{d}"
 
-    j = api_get(url)
-    candles = j.get("data", {}).get("candles", [])
-    if not candles:
-        return pd.DataFrame()
+    # TODAY (intraday live)
+    if day == ist_today():
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded}/{INTERVAL}"
+        j = api_get(url)
+        candles = j.get("data", {}).get("candles", [])
+        if not candles:
+            return pd.DataFrame()
 
-    df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "oi"])
+        df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "oi"])
 
-    # Convert to IST and make timezone-naive (Excel friendly)
+    # PAST DAY (historical)
+    else:
+        d = date_str(day)
+        url = f"https://api.upstox.com/v2/historical-candle/{encoded}/{INTERVAL}/{d}/{d}"
+        j = api_get(url)
+        candles = j.get("data", {}).get("candles", [])
+        if not candles:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "oi"])
+
+    # Convert time -> IST and timezone-naive (Excel/Streamlit friendly)
     df["time"] = (
         pd.to_datetime(df["time"], utc=True, errors="coerce")
         .dt.tz_convert("Asia/Kolkata")
@@ -194,77 +208,6 @@ def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
     df = force_numeric_ohlcv(df)
     df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
     return df
-
-
-def get_data_by_mode(instrument_key: str, mode: str, picked_day):
-    """
-    mode:
-      - "LIVE_TODAY": only today (NO fallback)
-      - "AUTO": today else fallback to last available day
-      - "PICK": only picked_day (NO fallback)
-    """
-    today = ist_today()
-
-    if mode == "LIVE_TODAY":
-        df = fetch_candles_day(instrument_key, today)
-        return today, df, "TODAY_ONLY"
-
-    if mode == "PICK":
-        df = fetch_candles_day(instrument_key, picked_day)
-        return picked_day, df, f"PICK({date_str(picked_day)})"
-
-    # AUTO fallback
-    df_today = fetch_candles_day(instrument_key, today)
-    if not df_today.empty:
-        return today, df_today, "TODAY"
-
-    for i in range(1, MAX_LOOKBACK_DAYS + 1):
-        d = today - timedelta(days=i)
-        df = fetch_candles_day(instrument_key, d)
-        if not df.empty:
-            return d, df, f"FALLBACK({date_str(d)})"
-
-    return None, pd.DataFrame(), "NO_DATA"
-
-
-def get_nearest_expiry():
-    url = "https://api.upstox.com/v2/option/contract"
-    j = api_get(url, params={"instrument_key": UNDERLYING_KEY})
-    data = j.get("data", [])
-    expiries = sorted({row.get("expiry") for row in data if row.get("expiry")})
-    if not expiries:
-        raise RuntimeError("No expiries returned (option permission may be missing).")
-    today_s = date_str(ist_today())
-    for e in expiries:
-        if e >= today_s:
-            return e
-    return expiries[-1]
-
-
-def get_atm_ce_pe_keys(expiry_date: str):
-    url = "https://api.upstox.com/v2/option/chain"
-    j = api_get(url, params={"instrument_key": UNDERLYING_KEY, "expiry_date": expiry_date})
-    chain = j.get("data", [])
-    if not chain:
-        raise RuntimeError("Empty option chain. Check expiry/permissions.")
-
-    spot = None
-    for row in chain:
-        if row.get("underlying_spot_price") is not None:
-            spot = row["underlying_spot_price"]
-            break
-    if spot is None:
-        raise RuntimeError("underlying_spot_price not found.")
-
-    best = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
-    strike = best.get("strike_price")
-
-    ce_key = (best.get("call_options") or {}).get("instrument_key")
-    pe_key = (best.get("put_options") or {}).get("instrument_key")
-    if not ce_key or not pe_key:
-        raise RuntimeError("ATM CE/PE instrument keys missing.")
-
-    return float(spot), strike, ce_key, pe_key
 
 # ==========================================================
 # INDICATORS
