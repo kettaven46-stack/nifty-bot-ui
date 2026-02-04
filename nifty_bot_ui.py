@@ -10,15 +10,17 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ==========================================================
-# CONFIG (EDIT)
+# CONFIG
 # ==========================================================
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2UEE2QzUiLCJqdGkiOiI2OTgyYTQ1YjFmNWJkMTYyNzRhMDQyMTciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzcwMTY5NDM1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzAyNDI0MDB9.FE02xu-nqq8xWsPaGNTCn59TmbzFWtE7Cj_m1xHplOE"  # <-- paste token here
+# Local default (will be overwritten by Streamlit Secrets if present)
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2UEE2QzUiLCJqdGkiOiI2OTgyYTQ1YjFmNWJkMTYyNzRhMDQyMTciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzcwMTY5NDM1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzAyNDI0MDB9.FE02xu-nqq8xWsPaGNTCn59TmbzFWtE7Cj_m1xHplOE"
 
 UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 INTERVAL = "1minute"
 UPDATE_EVERY_SECONDS = 60
 
-SAVE_PATH = r"C:\temp"   # change to r"C:\Users\rames\OneDrive\Desktop\excel_trading" if you prefer
+# Local save path (works on your PC). On Streamlit Cloud this may not persist.
+SAVE_PATH = os.environ.get("BOT_SAVE_PATH", "bot_data")
 STATE_FILE = os.path.join(SAVE_PATH, "bot_state.json")
 TRADES_FILE = os.path.join(SAVE_PATH, "bot_trades.csv")
 LOG_FILE = os.path.join(SAVE_PATH, "bot_log.txt")
@@ -30,9 +32,8 @@ MAX_LOOKBACK_DAYS = 15
 
 DEFAULT_LIVE_TRADING = False  # safety: OFF
 
-
 # ==========================================================
-# STRATEGY DEFAULT RULES (EDIT in UI also)
+# STRATEGY DEFAULT RULES (Editable from UI)
 # ==========================================================
 DEFAULT_RULES = {
     "name": "NIFTY + ATM confirmation",
@@ -52,13 +53,12 @@ DEFAULT_RULES = {
     "one_trade_at_a_time": True,
     "cooldown_minutes": 5,
 
-    # safety
-    "paper_mode": True,   # True means no real order placement
+    # Safety
+    "paper_mode": True,
 }
 
-
 # ==========================================================
-# FILE / STATE (FIXED: NO RECURSION)
+# FILE / STATE (NO RECURSION)
 # ==========================================================
 def ensure_paths():
     os.makedirs(SAVE_PATH, exist_ok=True)
@@ -103,7 +103,7 @@ def read_state():
 
 
 def write_state(state: dict):
-    # do NOT call ensure_paths() here -> avoids recursion
+    # do NOT call ensure_paths() here
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
@@ -123,7 +123,6 @@ def log_line(msg: str):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
-
 # ==========================================================
 # TIME HELPERS
 # ==========================================================
@@ -142,11 +141,13 @@ def market_state():
     close_t = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
     return "OPEN" if (open_t <= now <= close_t) else "CLOSED"
 
-
 # ==========================================================
 # API HELPERS
 # ==========================================================
 def api_get(url, params=None):
+    if not ACCESS_TOKEN or "PASTE_YOUR" in ACCESS_TOKEN:
+        raise RuntimeError("ACCESS_TOKEN missing. Set Streamlit Secrets ACCESS_TOKEN or paste it in code (not recommended).")
+
     headers = {"Accept": "application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
     r = requests.get(url, params=params, headers=headers, timeout=30)
     if r.status_code != 200:
@@ -211,7 +212,7 @@ def get_nearest_expiry():
     data = j.get("data", [])
     expiries = sorted({row.get("expiry") for row in data if row.get("expiry")})
     if not expiries:
-        raise RuntimeError("No expiries returned. Option permission may be missing.")
+        raise RuntimeError("No expiries returned (option permission may be missing).")
     today_s = date_str(ist_today())
     for e in expiries:
         if e >= today_s:
@@ -243,7 +244,6 @@ def get_atm_ce_pe_keys(expiry_date: str):
         raise RuntimeError("ATM CE/PE instrument keys missing.")
 
     return float(spot), strike, ce_key, pe_key
-
 
 # ==========================================================
 # INDICATORS
@@ -335,9 +335,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["mfi"] = mfi(df["high"], df["low"], df["close"], df["volume"], 14)
     return df
 
-
 # ==========================================================
-# SIGNAL LOGIC (Sample strategy)
+# SIGNAL LOGIC (Sample strategy - edit later)
 # ==========================================================
 def macd_cross_up(df):
     if len(df) < 3:
@@ -392,9 +391,8 @@ def compute_signal(rules, idx_df, ce_df, pe_df):
         return "BUY_PE", "Conditions met"
     return "NONE", "No setup"
 
-
 # ==========================================================
-# EXECUTION (Paper mode)
+# BOT LOOP (Run locally only: python nifty_bot_ui.py bot)
 # ==========================================================
 def cooldown_ok(state, rules):
     last_ts = state.get("last_trade_ts_ist", "")
@@ -407,7 +405,6 @@ def cooldown_ok(state, rules):
         return mins >= float(rules.get("cooldown_minutes", 0))
     except Exception:
         return True
-
 
 def execute_signal(state, rules, signal, ce_key, pe_key, ce_df, pe_df):
     position = state.get("position", "FLAT")
@@ -446,18 +443,13 @@ def execute_signal(state, rules, signal, ce_key, pe_key, ce_df, pe_df):
 
     return "NOOP", "No action"
 
-
-# ==========================================================
-# BOT LOOP
-# ==========================================================
 def bot_loop():
     ensure_paths()
-    log_line("BOT STARTED")
+    log_line("BOT STARTED (LOCAL MODE)")
 
     while True:
         state = read_state()
         rules = state.get("rules", DEFAULT_RULES)
-
         try:
             now = ist_now()
             mkt = market_state()
@@ -511,20 +503,76 @@ def bot_loop():
 
         time.sleep(UPDATE_EVERY_SECONDS)
 
-
 # ==========================================================
-# UI (Streamlit)
+# UI APP (Streamlit Cloud Safe)
 # ==========================================================
 def ui_app():
     import streamlit as st
 
-    ensure_paths()
-    st.set_page_config(page_title="NIFTY Auto Bot", layout="wide")
-    st.title("📈 NIFTY Auto Bot (Index + ATM CE/PE)")
+    # Use token from Streamlit Secrets if available
+    global ACCESS_TOKEN
+    if "ACCESS_TOKEN" in st.secrets:
+        ACCESS_TOKEN = st.secrets["ACCESS_TOKEN"]
 
+    ensure_paths()
+    st.set_page_config(page_title="NIFTY Bot UI", layout="wide")
+    st.title("📈 NIFTY Bot UI (Index + ATM CE/PE)")
+    st.caption("Cloud UI mode: refreshes on demand. For auto trading run bot locally: `python nifty_bot_ui.py bot`")
+
+    # Refresh controls (no infinite loops)
+    colA, colB = st.columns([1, 4])
+    if colA.button("🔄 Refresh now"):
+        st.rerun()
+    colB.caption("Tip: press Refresh for latest data (Streamlit Cloud may not allow background loops).")
+
+    # Read state (if bot is running locally, you can push state to repo storage; cloud won't see your local file)
+    # So we also fetch LIVE data right here for display.
     state = read_state()
     rules = state.get("rules", DEFAULT_RULES)
 
+    # Try fetching live snapshot right now (cloud-safe)
+    err = ""
+    try:
+        mkt = market_state()
+        expiry = get_nearest_expiry()
+        spot, strike, ce_key, pe_key = get_atm_ce_pe_keys(expiry)
+
+        idx_day, idx_df, idx_mode = choose_data_day(UNDERLYING_KEY)
+        ce_day, ce_df, ce_mode = choose_data_day(ce_key)
+        pe_day, pe_df, pe_mode = choose_data_day(pe_key)
+
+        idx_df = add_indicators(idx_df)
+        ce_df = add_indicators(ce_df)
+        pe_df = add_indicators(pe_df)
+
+        signal, reason = compute_signal(rules, idx_df, ce_df, pe_df)
+
+        state.update({
+            "status": "UI_LIVE",
+            "last_update_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "market_state": mkt,
+            "today_ref": date_str(ist_today()),
+            "expiry": expiry,
+            "spot": spot,
+            "atm_strike": strike,
+            "index_mode": idx_mode,
+            "ce_mode": ce_mode,
+            "pe_mode": pe_mode,
+            "last_signal": signal,
+            "last_signal_ts_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "errors": "",
+            "last_reason": reason
+        })
+        write_state(state)
+
+    except Exception as e:
+        err = str(e)
+        state["status"] = "ERROR"
+        state["errors"] = err
+        state["last_update_ist"] = ist_now().strftime("%Y-%m-%d %H:%M:%S")
+        write_state(state)
+
+    # UI metrics
     c1, c2, c3 = st.columns(3)
     c1.metric("Status", state.get("status", ""))
     c2.metric("Market", state.get("market_state", ""))
@@ -537,11 +585,10 @@ def ui_app():
     c.metric("Spot", f"{state.get('spot', 0):.2f}" if state.get("spot") else "—")
     d.metric("ATM Strike", str(state.get("atm_strike", "—")))
 
-    st.write("### Signal / Position")
-    s1, s2, s3 = st.columns(3)
+    st.write("### Signal")
+    s1, s2 = st.columns(2)
     s1.metric("Last Signal", state.get("last_signal", "NONE"))
-    s2.metric("Position", state.get("position", "FLAT"))
-    s3.metric("Reason", state.get("last_reason", ""))
+    s2.metric("Reason", state.get("last_reason", ""))
 
     if state.get("errors"):
         st.error(state["errors"])
@@ -552,7 +599,7 @@ def ui_app():
         rules["min_adx"] = st.number_input("Min ADX (Index)", value=float(rules.get("min_adx", 18)))
         rules["rsi_buy"] = st.number_input("RSI Buy threshold (Index)", value=float(rules.get("rsi_buy", 55)))
         rules["rsi_sell"] = st.number_input("RSI Sell threshold (Index)", value=float(rules.get("rsi_sell", 45)))
-        rules["macd_mode"] = st.selectbox("MACD Mode", ["cross", "above"], index=0 if rules.get("macd_mode","cross")=="cross" else 1)
+        rules["macd_mode"] = st.selectbox("MACD Mode", ["cross", "above"], index=0 if rules.get("macd_mode", "cross") == "cross" else 1)
 
         rules["confirm_with_options"] = st.checkbox("Confirm with Options", value=bool(rules.get("confirm_with_options", True)))
         rules["ce_confirm_rsi"] = st.number_input("CE confirm RSI >=", value=float(rules.get("ce_confirm_rsi", 52)))
@@ -562,7 +609,7 @@ def ui_app():
         rules["cooldown_minutes"] = st.number_input("Cooldown minutes", value=float(rules.get("cooldown_minutes", 5)))
 
         rules["paper_mode"] = st.checkbox("Paper Mode (no real orders)", value=bool(rules.get("paper_mode", True)))
-        rules["live_trading"] = st.checkbox("LIVE trading switch (future use)", value=bool(rules.get("live_trading", False)))
+        rules["live_trading"] = st.checkbox("LIVE trading (not implemented here)", value=bool(rules.get("live_trading", False)))
 
         if st.form_submit_button("Save Rules"):
             state["rules"] = rules
@@ -570,23 +617,36 @@ def ui_app():
             st.success("Saved ✅")
 
     st.write("---")
-    st.subheader("Trades Log")
+    st.subheader("Latest Candles (with indicators)")
+
+    # Show data tables if available
     try:
-        tdf = pd.read_csv(TRADES_FILE)
-        st.dataframe(tdf.tail(100), use_container_width=True)
+        if 'idx_df' in locals() and idx_df is not None and not idx_df.empty:
+            st.write("#### INDEX")
+            st.dataframe(idx_df.tail(50), use_container_width=True)
+        if 'ce_df' in locals() and ce_df is not None and not ce_df.empty:
+            st.write("#### ATM CE")
+            st.dataframe(ce_df.tail(50), use_container_width=True)
+        if 'pe_df' in locals() and pe_df is not None and not pe_df.empty:
+            st.write("#### ATM PE")
+            st.dataframe(pe_df.tail(50), use_container_width=True)
     except Exception as e:
         st.warning(str(e))
 
-    st.caption("Run BOT separately: python nifty_bot_ui.py bot")
-
+    st.write("---")
+    st.subheader("Trades Log (local bot will write here)")
+    try:
+        tdf = pd.read_csv(TRADES_FILE)
+        st.dataframe(tdf.tail(100), use_container_width=True)
+    except Exception:
+        st.info("No trades file yet (or not persisted on cloud).")
 
 # ==========================================================
-# ENTRYPOINT
+# ENTRYPOINT (IMPORTANT: cloud-safe)
 # ==========================================================
 if __name__ == "__main__":
     ensure_paths()
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "bot":
         bot_loop()
     else:
-        print("Run BOT: python nifty_bot_ui.py bot")
-        print("Run UI : streamlit run nifty_bot_ui.py")
+        ui_app()
