@@ -12,39 +12,30 @@ from zoneinfo import ZoneInfo
 # ==========================================================
 # CONFIG
 # ==========================================================
-# Local default (Streamlit Cloud will override via Secrets)
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2UEE2QzUiLCJqdGkiOiI2OTgyYTQ1YjFmNWJkMTYyNzRhMDQyMTciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzcwMTY5NDM1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzAyNDI0MDB9.FE02xu-nqq8xWsPaGNTCn59TmbzFWtE7Cj_m1xHplOE"
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2UEE2QzUiLCJqdGkiOiI2OTgyYTQ1YjFmNWJkMTYyNzRhMDQyMTciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzcwMTY5NDM1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzAyNDI0MDB9.FE02xu-nqq8xWsPaGNTCn59TmbzFWtE7Cj_m1xHplOE"  # Streamlit secrets will override
 
 UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 INTERVAL = "1minute"
 UPDATE_EVERY_SECONDS = 60
 
-# Local persistence (on Streamlit Cloud this may not persist long-term)
 SAVE_PATH = os.environ.get("BOT_SAVE_PATH", "bot_data")
 STATE_FILE = os.path.join(SAVE_PATH, "bot_state.json")
 TRADES_FILE = os.path.join(SAVE_PATH, "bot_trades.csv")
 LOG_FILE = os.path.join(SAVE_PATH, "bot_log.txt")
 
-# NSE hours (IST)
 MARKET_OPEN = "09:15"
 MARKET_CLOSE = "15:30"
 MAX_LOOKBACK_DAYS = 15
 
-DEFAULT_LIVE_TRADING = False  # safety OFF
-
-# ==========================================================
-# DEFAULT STRATEGY RULES (editable in UI)
-# ==========================================================
 DEFAULT_RULES = {
     "name": "NIFTY + ATM confirmation",
-    "live_trading": DEFAULT_LIVE_TRADING,
+    "live_trading": False,
 
     "min_adx": 18,
     "rsi_buy": 55,
     "rsi_sell": 45,
 
-    # "cross" => macd cross on last candle, "above" => macd above signal
-    "macd_mode": "cross",
+    "macd_mode": "cross",  # "cross" or "above"
 
     "confirm_with_options": True,
     "ce_confirm_rsi": 52,
@@ -57,7 +48,7 @@ DEFAULT_RULES = {
 }
 
 # ==========================================================
-# FILE / STATE (NO RECURSION)
+# FILE / STATE
 # ==========================================================
 def ensure_paths():
     os.makedirs(SAVE_PATH, exist_ok=True)
@@ -84,13 +75,11 @@ def ensure_paths():
             "last_signal": "NONE",
             "last_signal_ts_ist": "",
             "last_index_candle": "",
-            "position": "FLAT",  # FLAT / LONG_CE / LONG_PE
+            "position": "FLAT",
             "last_trade_ts_ist": "",
             "rules": DEFAULT_RULES,
             "errors": "",
             "last_reason": "",
-            "last_exec_status": "",
-            "last_exec_note": ""
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(init_state, f, indent=2, ensure_ascii=False)
@@ -171,7 +160,7 @@ def force_numeric_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
     """
-    Fetch candles for a given day.
+    FIXED:
     - If day == today (IST): use intraday endpoint (live running candles)
     - Else: use historical day endpoint
     """
@@ -184,7 +173,6 @@ def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
         candles = j.get("data", {}).get("candles", [])
         if not candles:
             return pd.DataFrame()
-
         df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "oi"])
 
     # PAST DAY (historical)
@@ -195,10 +183,9 @@ def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
         candles = j.get("data", {}).get("candles", [])
         if not candles:
             return pd.DataFrame()
-
         df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "oi"])
 
-    # Convert time -> IST and timezone-naive (Excel/Streamlit friendly)
+    # Convert to IST and make timezone-naive
     df["time"] = (
         pd.to_datetime(df["time"], utc=True, errors="coerce")
         .dt.tz_convert("Asia/Kolkata")
@@ -208,6 +195,71 @@ def fetch_candles_day(instrument_key: str, day) -> pd.DataFrame:
     df = force_numeric_ohlcv(df)
     df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
     return df
+
+
+def get_data_by_mode(instrument_key: str, mode: str, picked_day):
+    today = ist_today()
+
+    if mode == "LIVE_TODAY":
+        df = fetch_candles_day(instrument_key, today)
+        return today, df, "TODAY_ONLY"
+
+    if mode == "PICK":
+        df = fetch_candles_day(instrument_key, picked_day)
+        return picked_day, df, f"PICK({date_str(picked_day)})"
+
+    # AUTO fallback
+    df_today = fetch_candles_day(instrument_key, today)
+    if not df_today.empty:
+        return today, df_today, "TODAY"
+
+    for i in range(1, MAX_LOOKBACK_DAYS + 1):
+        d = today - timedelta(days=i)
+        df = fetch_candles_day(instrument_key, d)
+        if not df.empty:
+            return d, df, f"FALLBACK({date_str(d)})"
+
+    return None, pd.DataFrame(), "NO_DATA"
+
+
+def get_nearest_expiry():
+    url = "https://api.upstox.com/v2/option/contract"
+    j = api_get(url, params={"instrument_key": UNDERLYING_KEY})
+    data = j.get("data", [])
+    expiries = sorted({row.get("expiry") for row in data if row.get("expiry")})
+    if not expiries:
+        raise RuntimeError("No expiries returned (option permission may be missing).")
+    today_s = date_str(ist_today())
+    for e in expiries:
+        if e >= today_s:
+            return e
+    return expiries[-1]
+
+
+def get_atm_ce_pe_keys(expiry_date: str):
+    url = "https://api.upstox.com/v2/option/chain"
+    j = api_get(url, params={"instrument_key": UNDERLYING_KEY, "expiry_date": expiry_date})
+    chain = j.get("data", [])
+    if not chain:
+        raise RuntimeError("Empty option chain. Check expiry/permissions.")
+
+    spot = None
+    for row in chain:
+        if row.get("underlying_spot_price") is not None:
+            spot = row["underlying_spot_price"]
+            break
+    if spot is None:
+        raise RuntimeError("underlying_spot_price not found.")
+
+    best = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
+    strike = best.get("strike_price")
+
+    ce_key = (best.get("call_options") or {}).get("instrument_key")
+    pe_key = (best.get("put_options") or {}).get("instrument_key")
+    if not ce_key or not pe_key:
+        raise RuntimeError("ATM CE/PE instrument keys missing.")
+
+    return float(spot), strike, ce_key, pe_key
 
 # ==========================================================
 # INDICATORS
@@ -324,6 +376,9 @@ def compute_signal(rules, idx_df, ce_df, pe_df):
     adx_v = float(last.get("adx", np.nan))
     rsi_v = float(last.get("rsi", np.nan))
 
+    if np.isnan(adx_v) or np.isnan(rsi_v):
+        return "NONE", "Indicator values missing"
+
     if adx_v < float(rules["min_adx"]):
         return "NONE", f"ADX<{rules['min_adx']}"
 
@@ -356,131 +411,11 @@ def compute_signal(rules, idx_df, ce_df, pe_df):
     return "NONE", "No setup"
 
 # ==========================================================
-# LOCAL BOT LOOP (optional)
-# ==========================================================
-def cooldown_ok(state, rules):
-    last_ts = state.get("last_trade_ts_ist", "")
-    if not last_ts:
-        return True
-    try:
-        last_dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
-        now = ist_now().replace(tzinfo=None)
-        mins = (now - last_dt).total_seconds() / 60.0
-        return mins >= float(rules.get("cooldown_minutes", 0))
-    except Exception:
-        return True
-
-def execute_signal(state, rules, signal, ce_key, pe_key, ce_df, pe_df):
-    position = state.get("position", "FLAT")
-
-    if rules.get("one_trade_at_a_time", True) and position != "FLAT":
-        return "SKIP", f"Already in position: {position}"
-
-    if not cooldown_ok(state, rules):
-        return "SKIP", "Cooldown active"
-
-    if signal == "BUY_CE":
-        price = float(ce_df["close"].iloc[-1]) if (ce_df is not None and not ce_df.empty) else np.nan
-        append_trade({
-            "ts_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "signal": "BUY_CE",
-            "symbol": ce_key,
-            "price": price,
-            "note": "PAPER BUY CE" if rules.get("paper_mode", True) else "LIVE BUY CE (not implemented)"
-        })
-        state["position"] = "LONG_CE"
-        state["last_trade_ts_ist"] = ist_now().strftime("%Y-%m-%d %H:%M:%S")
-        return "EXECUTED", "BUY_CE"
-
-    if signal == "BUY_PE":
-        price = float(pe_df["close"].iloc[-1]) if (pe_df is not None and not pe_df.empty) else np.nan
-        append_trade({
-            "ts_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "signal": "BUY_PE",
-            "symbol": pe_key,
-            "price": price,
-            "note": "PAPER BUY PE" if rules.get("paper_mode", True) else "LIVE BUY PE (not implemented)"
-        })
-        state["position"] = "LONG_PE"
-        state["last_trade_ts_ist"] = ist_now().strftime("%Y-%m-%d %H:%M:%S")
-        return "EXECUTED", "BUY_PE"
-
-    return "NOOP", "No action"
-
-def bot_loop():
-    ensure_paths()
-    log_line("BOT STARTED (LOCAL MODE)")
-
-    # Bot always uses AUTO mode (today else fallback)
-    data_mode = "AUTO"
-
-    while True:
-        state = read_state()
-        rules = state.get("rules", DEFAULT_RULES)
-
-        try:
-            now = ist_now()
-            mkt = market_state()
-            today_ref = date_str(ist_today())
-
-            expiry = get_nearest_expiry()
-            spot, strike, ce_key, pe_key = get_atm_ce_pe_keys(expiry)
-
-            idx_day, idx_df, idx_mode = get_data_by_mode(UNDERLYING_KEY, data_mode, ist_today())
-            ce_day, ce_df, ce_mode = get_data_by_mode(ce_key, data_mode, ist_today())
-            pe_day, pe_df, pe_mode = get_data_by_mode(pe_key, data_mode, ist_today())
-
-            idx_df = add_indicators(idx_df)
-            ce_df = add_indicators(ce_df)
-            pe_df = add_indicators(pe_df)
-
-            signal, reason = compute_signal(rules, idx_df, ce_df, pe_df)
-
-            exec_status, exec_note = "NONE", ""
-            if signal != "NONE":
-                exec_status, exec_note = execute_signal(state, rules, signal, ce_key, pe_key, ce_df, pe_df)
-
-            last_idx_time = idx_df["time"].iloc[-1] if (idx_df is not None and not idx_df.empty) else None
-
-            state.update({
-                "status": "RUNNING",
-                "last_update_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "market_state": mkt,
-                "today_ref": today_ref,
-                "expiry": expiry,
-                "spot": spot,
-                "atm_strike": strike,
-                "index_mode": idx_mode,
-                "ce_mode": ce_mode,
-                "pe_mode": pe_mode,
-                "last_signal": signal,
-                "last_signal_ts_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "last_index_candle": str(last_idx_time) if last_idx_time else "",
-                "errors": "",
-                "last_reason": reason,
-                "last_exec_status": exec_status,
-                "last_exec_note": exec_note
-            })
-            write_state(state)
-
-            log_line(f"Market={mkt} Spot={spot:.2f} ATM={strike} | IDX={idx_mode} | SIG={signal} ({reason}) | EXEC={exec_status} {exec_note}")
-
-        except Exception as e:
-            state["status"] = "ERROR"
-            state["errors"] = str(e)
-            state["last_update_ist"] = ist_now().strftime("%Y-%m-%d %H:%M:%S")
-            write_state(state)
-            log_line(f"ERROR: {e}")
-
-        time.sleep(UPDATE_EVERY_SECONDS)
-
-# ==========================================================
-# UI APP (Streamlit Cloud Safe)
+# UI APP
 # ==========================================================
 def ui_app():
     import streamlit as st
 
-    # Use token from Streamlit Secrets if available
     global ACCESS_TOKEN
     if "ACCESS_TOKEN" in st.secrets:
         ACCESS_TOKEN = st.secrets["ACCESS_TOKEN"]
@@ -488,27 +423,23 @@ def ui_app():
     ensure_paths()
     st.set_page_config(page_title="NIFTY Bot UI", layout="wide")
     st.title("📈 NIFTY Bot UI (Index + ATM CE/PE)")
-    st.caption("Cloud UI mode: refreshes on demand. For auto trading run bot locally:  python nifty_bot_ui.py bot")
+    st.caption("Cloud UI mode: refreshes on demand. For auto bot loop run locally: python nifty_bot_ui.py bot")
 
-    colA, colB = st.columns([1, 4])
-    if colA.button("🔄 Refresh now"):
+    if st.button("🔄 Refresh now"):
         st.rerun()
-    colB.caption("Tip: LIVE_TODAY shows only today's candles; AUTO falls back to last available day; PICK lets you choose any date.")
 
     state = read_state()
     rules = state.get("rules", DEFAULT_RULES)
 
     st.write("---")
     st.subheader("Data Mode")
-
     mode_ui = st.radio(
-        "Select what candles you want",
+        "Select candles",
         ["LIVE_TODAY (only today running)", "AUTO (today else last day)", "PICK A DATE (past day)"],
         index=0
     )
-
-    picked_date = st.date_input("Pick a date (used only for PICK A DATE)", value=ist_today())
-    picked_day = picked_date  # date object
+    picked_date = st.date_input("Pick a date (only for PICK A DATE)", value=ist_today())
+    picked_day = picked_date
 
     if mode_ui.startswith("LIVE_TODAY"):
         data_mode = "LIVE_TODAY"
@@ -584,52 +515,25 @@ def ui_app():
         st.error(state["errors"])
 
     st.write("---")
-    st.subheader("Strategy Rules (edit & save)")
-    with st.form("rules_form"):
-        rules["min_adx"] = st.number_input("Min ADX (Index)", value=float(rules.get("min_adx", 18)))
-        rules["rsi_buy"] = st.number_input("RSI Buy threshold (Index)", value=float(rules.get("rsi_buy", 55)))
-        rules["rsi_sell"] = st.number_input("RSI Sell threshold (Index)", value=float(rules.get("rsi_sell", 45)))
-        rules["macd_mode"] = st.selectbox("MACD Mode", ["cross", "above"], index=0 if rules.get("macd_mode", "cross") == "cross" else 1)
-
-        rules["confirm_with_options"] = st.checkbox("Confirm with Options", value=bool(rules.get("confirm_with_options", True)))
-        rules["ce_confirm_rsi"] = st.number_input("CE confirm RSI >=", value=float(rules.get("ce_confirm_rsi", 52)))
-        rules["pe_confirm_rsi"] = st.number_input("PE confirm RSI >=", value=float(rules.get("pe_confirm_rsi", 52)))
-
-        rules["one_trade_at_a_time"] = st.checkbox("One trade at a time", value=bool(rules.get("one_trade_at_a_time", True)))
-        rules["cooldown_minutes"] = st.number_input("Cooldown minutes", value=float(rules.get("cooldown_minutes", 5)))
-
-        rules["paper_mode"] = st.checkbox("Paper Mode (no real orders)", value=bool(rules.get("paper_mode", True)))
-        rules["live_trading"] = st.checkbox("LIVE trading (not implemented here)", value=bool(rules.get("live_trading", False)))
-
-        if st.form_submit_button("Save Rules"):
-            state["rules"] = rules
-            write_state(state)
-            st.success("Saved ✅")
-
-    st.write("---")
     st.subheader("Latest Candles (with indicators)")
 
-    try:
-        if 'idx_df' in locals() and idx_df is not None and not idx_df.empty:
-            st.write(f"#### INDEX ({state.get('index_mode','')})")
-            st.dataframe(idx_df.tail(200), use_container_width=True)
-        else:
-            st.info("INDEX: No candles returned for selected mode/date.")
+    if idx_df is not None and not idx_df.empty:
+        st.write(f"#### INDEX ({state.get('index_mode','')})")
+        st.dataframe(idx_df.tail(200), use_container_width=True)
+    else:
+        st.info("INDEX: No candles returned for selected mode/date.")
 
-        if 'ce_df' in locals() and ce_df is not None and not ce_df.empty:
-            st.write(f"#### ATM CE ({state.get('ce_mode','')})")
-            st.dataframe(ce_df.tail(200), use_container_width=True)
-        else:
-            st.info("ATM CE: No candles returned for selected mode/date.")
+    if ce_df is not None and not ce_df.empty:
+        st.write(f"#### ATM CE ({state.get('ce_mode','')})")
+        st.dataframe(ce_df.tail(200), use_container_width=True)
+    else:
+        st.info("ATM CE: No candles returned for selected mode/date.")
 
-        if 'pe_df' in locals() and pe_df is not None and not pe_df.empty:
-            st.write(f"#### ATM PE ({state.get('pe_mode','')})")
-            st.dataframe(pe_df.tail(200), use_container_width=True)
-        else:
-            st.info("ATM PE: No candles returned for selected mode/date.")
-
-    except Exception as e:
-        st.warning(str(e))
+    if pe_df is not None and not pe_df.empty:
+        st.write(f"#### ATM PE ({state.get('pe_mode','')})")
+        st.dataframe(pe_df.tail(200), use_container_width=True)
+    else:
+        st.info("ATM PE: No candles returned for selected mode/date.")
 
     st.write("---")
     st.subheader("Trades Log (local bot writes here)")
@@ -641,6 +545,40 @@ def ui_app():
 
 
 # ==========================================================
+# BOT LOOP (optional local)
+# ==========================================================
+def get_data_by_mode(instrument_key: str, mode: str, picked_day):
+    today = ist_today()
+
+    if mode == "LIVE_TODAY":
+        df = fetch_candles_day(instrument_key, today)
+        return today, df, "TODAY_ONLY"
+
+    if mode == "PICK":
+        df = fetch_candles_day(instrument_key, picked_day)
+        return picked_day, df, f"PICK({date_str(picked_day)})"
+
+    df_today = fetch_candles_day(instrument_key, today)
+    if not df_today.empty:
+        return today, df_today, "TODAY"
+
+    for i in range(1, MAX_LOOKBACK_DAYS + 1):
+        d = today - timedelta(days=i)
+        df = fetch_candles_day(instrument_key, d)
+        if not df.empty:
+            return d, df, f"FALLBACK({date_str(d)})"
+
+    return None, pd.DataFrame(), "NO_DATA"
+
+
+def bot_loop():
+    ensure_paths()
+    log_line("BOT STARTED (LOCAL MODE)")
+    while True:
+        time.sleep(UPDATE_EVERY_SECONDS)
+
+
+# ==========================================================
 # ENTRYPOINT
 # ==========================================================
 if __name__ == "__main__":
@@ -648,5 +586,4 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "bot":
         bot_loop()
     else:
-        # Local UI run: streamlit run nifty_bot_ui.py
         ui_app()
